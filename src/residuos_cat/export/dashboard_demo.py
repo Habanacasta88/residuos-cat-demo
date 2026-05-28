@@ -76,7 +76,7 @@ def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * radius * math.asin(math.sqrt(a))
 
 
-def _smart_search(
+def _smart_search(  # noqa: PLR0911 — cascada de 4 niveles, cada uno con return propio
     df: pl.DataFrame,
     query_name: str,
     query_nif: str,
@@ -115,17 +115,20 @@ def _smart_search(
     #     Polars no tiene strip_accents nativo, así que usamos map_elements para
     #     normalizar facility_name al vuelo.
     m1 = df.filter(
-        pl.col("facility_name")
-        .map_elements(
+        pl.col("facility_name").map_elements(
             lambda s: q_normalized in _strip_accents(s.lower()) if s else False,
             return_dtype=pl.Boolean,
         )
     )
     if m1.height > 0:
         n_emp = m1["facility_id_external"].n_unique()
-        return m1, "exact", (
-            f"✅ **{n_emp} empresa(s)** encontradas con coincidencia directa en razón social "
-            f"para `{q}` ({m1.height:,} líneas)."
+        return (
+            m1,
+            "exact",
+            (
+                f"✅ **{n_emp} empresa(s)** encontradas con coincidencia directa en razón social "
+                f"para `{q}` ({m1.height:,} líneas)."
+            ),
         )
 
     # 2b. Alias marca → razón social
@@ -141,11 +144,15 @@ def _smart_search(
             if m2.height > 0:
                 n_emp = m2["facility_id_external"].n_unique()
                 terms_str = " / ".join(f"'{t}'" for t in aliased_terms)
-                return m2, "alias", (
-                    f"✅ **{n_emp} empresa(s)** encontradas vía alias conocido: "
-                    f"`{q}` → {terms_str} ({m2.height:,} líneas).\n\n"
-                    f"💡 *Nuestras fuentes públicas usan razón social oficial. "
-                    f"Tu marca comercial está mapeada internamente.*"
+                return (
+                    m2,
+                    "alias",
+                    (
+                        f"✅ **{n_emp} empresa(s)** encontradas vía alias conocido: "
+                        f"`{q}` → {terms_str} ({m2.height:,} líneas).\n\n"
+                        f"💡 *Nuestras fuentes públicas usan razón social oficial. "
+                        f"Tu marca comercial está mapeada internamente.*"
+                    ),
                 )
 
     # 2c. Fuzzy match con rapidfuzz (solo si query >= FUZZY_MIN_QUERY_LEN chars)
@@ -171,25 +178,33 @@ def _smart_search(
                 if m3.height > 0:
                     n_emp = m3["facility_id_external"].n_unique()
                     top_examples = ", ".join(f"`{n}`" for n in matched_names[:3])
-                    return m3, "fuzzy", (
-                        f"🔍 **{n_emp} empresa(s)** encontradas por **similitud aproximada** "
-                        f"(score medio {avg_score:.0f}/100) para `{q}`.\n\n"
-                        f"Top candidatos: {top_examples}\n\n"
-                        f"💡 *Si no es la empresa que buscas, prueba con la razón social oficial "
-                        f"o más texto.*"
+                    return (
+                        m3,
+                        "fuzzy",
+                        (
+                            f"🔍 **{n_emp} empresa(s)** encontradas por **similitud aproximada** "
+                            f"(score medio {avg_score:.0f}/100) para `{q}`.\n\n"
+                            f"Top candidatos: {top_examples}\n\n"
+                            f"💡 *Si no es la empresa que buscas, prueba con la razón social oficial "
+                            f"o más texto.*"
+                        ),
                     )
         except ImportError:
             # rapidfuzz no instalado, ignorar fuzzy
             pass
 
     # 2d. Sin resultados ni en exact, ni alias, ni fuzzy
-    return df.filter(pl.lit(False)), "none", (
-        f"❌ **Sin coincidencias** para `{q}`.\n\n"
-        f"Causas posibles: (a) la empresa no opera en Cataluña, "
-        f"(b) no está autorizada en RGPGRC ni reporta a PRTR-ES, "
-        f"(c) la razón social oficial es muy distinta a la marca comercial.\n\n"
-        f"📧 [Avísame para añadirla al diccionario de aliases]"
-        f"(mailto:{CONTACT_EMAIL}?subject=Empresa%20que%20no%20aparece%20-%20{q})"
+    return (
+        df.filter(pl.lit(False)),
+        "none",
+        (
+            f"❌ **Sin coincidencias** para `{q}`.\n\n"
+            f"Causas posibles: (a) la empresa no opera en Cataluña, "
+            f"(b) no está autorizada en RGPGRC ni reporta a PRTR-ES, "
+            f"(c) la razón social oficial es muy distinta a la marca comercial.\n\n"
+            f"📧 [Avísame para añadirla al diccionario de aliases]"
+            f"(mailto:{CONTACT_EMAIL}?subject=Empresa%20que%20no%20aparece%20-%20{q})"
+        ),
     )
 
 
@@ -591,7 +606,7 @@ def main() -> None:
     # MENSAJE DE BÚSQUEDA + KPIs
     # ════════════════════════════════════════════════════════════
     if has_search and match_msg:
-        if match_type == "exact" or match_type == "nif":
+        if match_type in {"exact", "nif"}:
             st.success(match_msg)
         elif match_type == "alias":
             st.info(match_msg)
@@ -628,7 +643,9 @@ def main() -> None:
     )
 
     with tab_table:
-        st.subheader(f"Mostrando top {min(top_n_display, n_leads):,} de {n_leads:,} leads filtrados")
+        st.subheader(
+            f"Mostrando top {min(top_n_display, n_leads):,} de {n_leads:,} leads filtrados"
+        )
         sort_desc = sort_by not in ("facility_name", "dist_recalc_km")
         display = (
             filtered.sort(sort_by, descending=sort_desc, nulls_last=True)
