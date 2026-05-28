@@ -660,41 +660,69 @@ def main() -> None:
     # ════════════════════════════════════════════════════════════
     # TABS
     # ════════════════════════════════════════════════════════════
-    tab_table, tab_map, tab_dist, tab_companies = st.tabs(
-        ["📋 Top leads", "🗺️ Mapa", "📊 Distribuciones", "🏢 Por empresa"]
+    tab_table, tab_map, tab_dist, tab_companies, tab_gestor = st.tabs(
+        [
+            "📋 Top leads",
+            "🗺️ Mapa",
+            "📊 Distribuciones",
+            "🏢 Por empresa",
+            "🔗 Gestor probable",
+        ]
     )
 
     with tab_table:
         st.subheader(
             f"Mostrando top {min(top_n_display, n_leads):,} de {n_leads:,} leads filtrados"
         )
+
+        # Detectar si tenemos las columnas nuevas de gestor probable
+        has_gestor_cols = "gestor_probable_1_nom" in filtered.columns
+
         sort_desc = sort_by not in ("facility_name", "dist_recalc_km")
+        base_cols = [
+            "Tipo",
+            pl.col("score_prioridad").round(1).alias("Score"),
+            pl.col("facility_name").alias("Empresa"),
+            pl.col("provincia").alias("Provincia"),
+            pl.col("municipi").alias("Municipio"),
+            pl.col("comarca").alias("Comarca"),
+            pl.col("ler_code").alias("LER"),
+            pl.col("descripcion_es").alias("Residuo"),
+            pl.col("clasificacion").alias("Clasif"),
+            pl.col("treatment_kind").alias("Trat"),
+            pl.col("quantity_tonnes_last").round(1).alias("t/año"),
+            pl.col("last_year").alias("Año"),
+            pl.col("n_years_reported").alias("Años_rep"),
+            pl.col("dist_recalc_km").round(1).alias("Dist_km"),
+            pl.col("nivel_confianza_id").alias("Confianza"),
+            pl.col("densidad_competencia").alias("Competencia"),
+        ]
+        if has_gestor_cols:
+            base_cols.extend(
+                [
+                    pl.col("gestor_probable_1_nom").alias("Gestor probable"),
+                    pl.col("gestor_probable_1_dist_km").alias("Dist gestor (km)"),
+                    pl.col("scrap_responsable").alias("SCRAP"),
+                ]
+            )
+
         display = (
             filtered.sort(sort_by, descending=sort_desc, nulls_last=True)
             .head(top_n_display)
             .with_columns(
                 pl.col("lead_type").replace(LEAD_TYPE_LABELS).alias("Tipo"),
             )
-            .select(
-                "Tipo",
-                pl.col("score_prioridad").round(1).alias("Score"),
-                pl.col("facility_name").alias("Empresa"),
-                pl.col("provincia").alias("Provincia"),
-                pl.col("municipi").alias("Municipio"),
-                pl.col("comarca").alias("Comarca"),
-                pl.col("ler_code").alias("LER"),
-                pl.col("descripcion_es").alias("Residuo"),
-                pl.col("clasificacion").alias("Clasif"),
-                pl.col("treatment_kind").alias("Trat"),
-                pl.col("quantity_tonnes_last").round(1).alias("t/año"),
-                pl.col("last_year").alias("Año"),
-                pl.col("n_years_reported").alias("Años_rep"),
-                pl.col("dist_recalc_km").round(1).alias("Dist_km"),
-                pl.col("nivel_confianza_id").alias("Confianza"),
-                pl.col("densidad_competencia").alias("Competencia"),
-            )
+            .select(base_cols)
         )
         st.dataframe(display.to_pandas(), use_container_width=True, height=600)
+
+        if has_gestor_cols:
+            st.warning(
+                "⚠️ **Gestor probable** y **Dist gestor (km)** son **hipótesis heurísticas** "
+                "(proximidad geográfica + tipo de residuo), NO declaración oficial. "
+                "**SCRAP** sí es definitivo cuando aplica (sistema colectivo responsable por ley). "
+                "Para confirmación oficial del gestor real, contrastar con SDR-ARC."
+            )
 
         st.info(
             "🔒 Columnas **Email**, **Teléfono**, **NIF web** y **URL** ocultas en la demo. "
@@ -808,6 +836,108 @@ def main() -> None:
             )
         )
         st.dataframe(by_company.to_pandas(), use_container_width=True, height=600)
+
+    # ── Tab 5: 🔗 Gestor probable (cruce productor ↔ gestor) ──
+    with tab_gestor:
+        st.subheader("🔗 Productor ↔ Gestor probable (heurística)")
+        st.markdown(
+            """
+            Para cada productor, las **3 gestoras catalanas más probables** que tratan
+            sus residuos, calculadas por **proximidad geográfica + tipo de residuo**
+            (penalizando gestoras municipales si el productor es industrial).
+
+            **No es declaración oficial** — es una hipótesis informada que sirve como
+            punto de partida comercial. Para confirmación, contrastar con SDR-ARC.
+            """
+        )
+
+        if "gestor_probable_1_nom" not in filtered.columns:
+            st.error(
+                "El dataset cargado no tiene las columnas de gestor probable. "
+                "Re-genera el demo con: "
+                "`uv run python -m residuos_cat.enrich.probable_gestor`"
+            )
+        else:
+            st.markdown("---")
+
+            # Vista 1: matriz productor → top 3 gestores (compacta)
+            st.markdown("### Lista compacta — todos los productores filtrados")
+            gestor_table = (
+                filtered.unique(subset=["facility_id_external", "ler_code"], keep="first")
+                .sort("score_prioridad", descending=True)
+                .head(top_n_display)
+                .select(
+                    pl.col("facility_name").alias("Productor"),
+                    pl.col("ler_code").alias("LER"),
+                    pl.col("scrap_responsable").alias("🏛️ SCRAP"),
+                    pl.col("gestor_probable_1_nom").alias("🥇 Gestor #1"),
+                    pl.col("gestor_probable_1_dist_km").alias("km"),
+                    pl.col("gestor_probable_2_nom").alias("🥈 Gestor #2"),
+                    pl.col("gestor_probable_2_dist_km").alias("km "),
+                    pl.col("gestor_probable_3_nom").alias("🥉 Gestor #3"),
+                    pl.col("gestor_probable_3_dist_km").alias("km  "),
+                )
+            )
+            st.dataframe(gestor_table.to_pandas(), use_container_width=True, height=500)
+
+            # Vista 2: cobertura SCRAP
+            st.markdown("---")
+            st.markdown("### Cobertura SCRAP (Sistema Colectivo Responsable)")
+            n_scrap = filtered.filter(pl.col("scrap_responsable").is_not_null()).height
+            st.metric(
+                "Leads con SCRAP identificado",
+                f"{n_scrap:,} / {n_leads:,}",
+                f"{100*n_scrap/n_leads:.1f}% del filtrado",
+            )
+
+            if n_scrap > 0:
+                scrap_breakdown = (
+                    filtered.filter(pl.col("scrap_responsable").is_not_null())
+                    .group_by("scrap_responsable")
+                    .agg(
+                        pl.col("facility_id_external").n_unique().alias("Empresas"),
+                        pl.col("quantity_tonnes_last").sum().round(1).alias("t/año"),
+                        pl.len().alias("Líneas"),
+                    )
+                    .sort("t/año", descending=True)
+                )
+                st.dataframe(
+                    scrap_breakdown.to_pandas(), use_container_width=True, hide_index=True
+                )
+
+            # Vista 3: ranking de gestoras candidatas (cuántas veces aparecen como #1)
+            st.markdown("---")
+            st.markdown(
+                "### 🏆 Ranking de gestoras candidatas — quién aparece más veces como Top 1"
+            )
+            top_gestores = (
+                filtered.filter(pl.col("gestor_probable_1_nom").is_not_null())
+                .group_by("gestor_probable_1_nom", "gestor_probable_1_poblacio")
+                .agg(
+                    pl.col("facility_id_external").n_unique().alias("Productores"),
+                    pl.col("quantity_tonnes_last").sum().round(0).alias("t/año total"),
+                    pl.col("gestor_probable_1_dist_km").mean().round(1).alias("Dist media (km)"),
+                )
+                .sort("Productores", descending=True)
+                .head(30)
+            )
+            st.dataframe(top_gestores.to_pandas(), use_container_width=True, hide_index=True)
+            st.caption(
+                "Las gestoras con más productores 'asignados' son las que probablemente "
+                "tienen mayor cuota de mercado en la zona. Útil para identificar competidores fuertes."
+            )
+
+            # Disclaimer legal
+            st.markdown("---")
+            st.warning(
+                "⚠️ **Caveat metodológico**: la columna 'Gestor probable' se calcula por "
+                "**proximidad geográfica** (haversine) + penalización gestores municipales si "
+                "el LER no es urbano (200xxx). **No es declaración oficial** ni reemplaza el "
+                "SDR-ARC. Cobertura: 100% del dataset con coord precisa o de provincia (centroide). "
+                "Precisión estimada: ~60-70% para coord precisa, ~30-40% para centroide. "
+                "**Para confirmación oficial**, solicitar al productor su Memoria Anual de "
+                "Producción de Residuos (MAPR), pública por Ley 19/2014 de transparencia."
+            )
 
     # ════════════════════════════════════════════════════════════
     # FOOTER
