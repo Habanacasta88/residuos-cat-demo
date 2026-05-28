@@ -702,7 +702,9 @@ def main() -> None:
                 [
                     pl.col("gestor_probable_1_nom").alias("Gestor probable"),
                     pl.col("gestor_probable_1_dist_km").alias("Dist gestor (km)"),
+                    pl.col("gestor_probable_1_score").alias("Match %"),
                     pl.col("scrap_responsable").alias("SCRAP"),
+                    pl.col("confianza_match_gestor").alias("Confianza match"),
                 ]
             )
 
@@ -869,9 +871,11 @@ def main() -> None:
                 .select(
                     pl.col("facility_name").alias("Productor"),
                     pl.col("ler_code").alias("LER"),
+                    pl.col("confianza_match_gestor").alias("Confianza"),
                     pl.col("scrap_responsable").alias("🏛️ SCRAP"),
                     pl.col("gestor_probable_1_nom").alias("🥇 Gestor #1"),
                     pl.col("gestor_probable_1_dist_km").alias("km"),
+                    pl.col("gestor_probable_1_score").alias("Match %"),
                     pl.col("gestor_probable_2_nom").alias("🥈 Gestor #2"),
                     pl.col("gestor_probable_2_dist_km").alias("km "),
                     pl.col("gestor_probable_3_nom").alias("🥉 Gestor #3"),
@@ -901,9 +905,7 @@ def main() -> None:
                     )
                     .sort("t/año", descending=True)
                 )
-                st.dataframe(
-                    scrap_breakdown.to_pandas(), use_container_width=True, hide_index=True
-                )
+                st.dataframe(scrap_breakdown.to_pandas(), use_container_width=True, hide_index=True)
 
             # Vista 3: ranking de gestoras candidatas (cuántas veces aparecen como #1)
             st.markdown("---")
