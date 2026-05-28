@@ -1,0 +1,7 @@
+# Dependencias para deploy en Streamlit Cloud
+# (subset mínimo de pyproject.toml — sin dev tools ni librerías de scraping)
+
+streamlit>=1.40
+polars>=1.20
+pyarrow>=18.0
+pandas>=2.2
