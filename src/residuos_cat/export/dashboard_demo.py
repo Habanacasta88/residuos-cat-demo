@@ -432,6 +432,26 @@ def main() -> None:
             help="Solo aparecen los municipios geocodificados (~14% del demo)",
         )
 
+    # ── Empresas específicas (multiselect con typeahead) ──
+    with st.sidebar.expander("🏢 Empresas específicas", expanded=False):
+        st.caption(
+            "Selecciona una o varias empresas concretas. Las demás se ocultan. "
+            "Útil para auditar tu cartera de clientes/prospects."
+        )
+        empresas_pool = sorted(leads_all["facility_name"].unique().drop_nulls().to_list())
+        empresas_sel = st.multiselect(
+            f"Empresas ({len(empresas_pool):,} disponibles)",
+            options=empresas_pool,
+            default=[],
+            help=(
+                "Escribe para buscar (typeahead). Marca varias para verlas todas juntas. "
+                "Si dejas vacío, no se aplica este filtro."
+            ),
+            placeholder="Ej: ECOPARC, GESTION DE RESIDUOS CONTAMINANTES…",
+        )
+        if empresas_sel:
+            st.success(f"{len(empresas_sel)} empresa(s) seleccionada(s)")
+
     with st.sidebar.expander("📅 Tiempo", expanded=False):
         years_disponibles = sorted(leads_all["last_year"].unique().drop_nulls().to_list())
         years_sel = st.multiselect(
@@ -546,6 +566,8 @@ def main() -> None:
         filtered = filtered.filter(pl.col("comarca").is_in(comarca_sel))
     if muni_sel:
         filtered = filtered.filter(pl.col("municipi").is_in(muni_sel))
+    if empresas_sel:
+        filtered = filtered.filter(pl.col("facility_name").is_in(empresas_sel))
 
     # 4. LER
     if target_lers:
