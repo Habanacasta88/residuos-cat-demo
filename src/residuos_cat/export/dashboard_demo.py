@@ -150,23 +150,31 @@ def main() -> None:
     # SIDEBAR — TODOS LOS FILTROS, ORGANIZADOS EN SECCIONES
     # ════════════════════════════════════════════════════════════
     st.sidebar.header("⚙️ Tus parámetros")
-    st.sidebar.markdown(
-        "Ajusta para simular el alcance de **tu** planta de gestión de residuos."
-    )
+    st.sidebar.markdown("Ajusta para simular el alcance de **tu** planta de gestión de residuos.")
 
     # ── Parámetros de tu planta (siempre visible) ──
     with st.sidebar.expander("📍 Tu planta + radio operativo", expanded=True):
         plant_lat = st.number_input(
-            "Latitud planta", value=41.3851, step=0.001, format="%.4f",
-            help="Por defecto: Barcelona centro"
+            "Latitud planta",
+            value=41.3851,
+            step=0.001,
+            format="%.4f",
+            help="Por defecto: Barcelona centro",
         )
         plant_lon = st.number_input(
-            "Longitud planta", value=2.1734, step=0.001, format="%.4f",
-            help="Por defecto: Barcelona centro"
+            "Longitud planta",
+            value=2.1734,
+            step=0.001,
+            format="%.4f",
+            help="Por defecto: Barcelona centro",
         )
         radius_km = st.slider(
-            "Radio operativo (km)", 10, 300, 120, step=10,
-            help="Distancia máxima rentable desde tu planta"
+            "Radio operativo (km)",
+            10,
+            300,
+            120,
+            step=10,
+            help="Distancia máxima rentable desde tu planta",
         )
         max_qty = int(leads_all["quantity_tonnes_last"].max() or 50000)
         cap_min, cap_max = st.slider(
@@ -402,9 +410,9 @@ def main() -> None:
         filtered = filtered.filter(pl.col("treatment_kind").is_in(treat_sel))
     if search_descripcion.strip():
         filtered = filtered.filter(
-            pl.col("descripcion_es").str.to_lowercase().str.contains(
-                search_descripcion.lower().strip()
-            )
+            pl.col("descripcion_es")
+            .str.to_lowercase()
+            .str.contains(search_descripcion.lower().strip())
         )
 
     # 5. Tiempo
@@ -425,9 +433,7 @@ def main() -> None:
     if not show_gestores:
         filtered = filtered.filter(pl.col("lead_type") == "productor")
     if only_with_precise_coord:
-        filtered = filtered.filter(
-            pl.col("huella_geocod").is_in(["accidents_greus", "geocoded"])
-        )
+        filtered = filtered.filter(pl.col("huella_geocod").is_in(["accidents_greus", "geocoded"]))
 
     # 8. Distancia y capacidad (recalculadas con la planta del usuario)
     filtered = filtered.with_columns(
@@ -497,8 +503,10 @@ def main() -> None:
 
     # ── Tab 1: Top leads ──
     with tab_table:
-        st.subheader(f"Mostrando top {min(top_n_display, n_leads):,} de {n_leads:,} leads filtrados")
-        sort_desc = sort_by != "facility_name" and sort_by != "dist_recalc_km"
+        st.subheader(
+            f"Mostrando top {min(top_n_display, n_leads):,} de {n_leads:,} leads filtrados"
+        )
+        sort_desc = sort_by not in ("facility_name", "dist_recalc_km")
         display = (
             filtered.sort(sort_by, descending=sort_desc, nulls_last=True)
             .head(top_n_display)
