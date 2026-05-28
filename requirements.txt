@@ -5,3 +5,4 @@ streamlit>=1.40
 polars>=1.20
 pyarrow>=18.0
 pandas>=2.2
+rapidfuzz>=3.10

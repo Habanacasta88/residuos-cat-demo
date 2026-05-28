@@ -6,6 +6,7 @@ Diferencias respecto a ``dashboard.py``:
 - CTAs de contacto en sidebar y footer.
 - Sin tabs de "competencia con NIF/contacto"; muestra todo agregado.
 - Tooltip explicando que el dataset completo se entrega con contacto+NIF tras contratar.
+- Búsqueda inteligente con cascada: exact → alias marca→razón social → fuzzy match.
 
 Pensado para deploy en Streamlit Cloud o HuggingFace Spaces.
 
@@ -20,6 +21,8 @@ from pathlib import Path
 
 import polars as pl
 
+from residuos_cat.export._aliases import find_aliased_terms
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEMO_DIR = REPO_ROOT / "data" / "demo"
 
@@ -27,8 +30,10 @@ LEADS_PATH = DEMO_DIR / "leads_scored_demo.parquet"
 GESTORES_PATH = DEMO_DIR / "gestores_demo.parquet"
 
 CONTACT_EMAIL = "yoelcp1988@gmail.com"
+FUZZY_SCORE_CUTOFF = 85  # 0-100, WRatio rapidfuzz (más estricto evita ruido)
+FUZZY_MIN_QUERY_LEN = 4  # queries más cortas NO disparan fuzzy (evita falsos positivos)
 
-# Mapeos para mostrar etiquetas más amigables que los códigos crudos
+# Etiquetas amigables
 CLASIFICACION_LABELS = {
     "P": "Peligroso (P)",
     "NP": "No peligroso (NP)",
@@ -47,6 +52,18 @@ COMPETENCIA_LABELS = {
     "media": "Media — competencia moderada",
     "alta": "Alta — saturado",
 }
+LEAD_TYPE_LABELS = {
+    "productor": "🏭 Productor",
+    "gestor_sospechoso": "♻️ Gestor",
+}
+
+
+def _strip_accents(s: str) -> str:
+    """Quita tildes y diacríticos. 'Compañía' → 'Compania', 'Damm' → 'Damm'."""
+    import unicodedata
+
+    nfkd = unicodedata.normalize("NFKD", s)
+    return "".join(c for c in nfkd if not unicodedata.combining(c))
 
 
 def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -57,6 +74,123 @@ def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     dlon = math.radians(lon2 - lon1)
     a = math.sin(dlat / 2) ** 2 + math.cos(rlat1) * math.cos(rlat2) * math.sin(dlon / 2) ** 2
     return 2 * radius * math.asin(math.sqrt(a))
+
+
+def _smart_search(
+    df: pl.DataFrame,
+    query_name: str,
+    query_nif: str,
+) -> tuple[pl.DataFrame, str, str]:
+    """Búsqueda en cascada: NIF exacto → contains → alias → fuzzy.
+
+    Devuelve:
+        (df filtrado, tipo de match para mostrar, mensaje contextual)
+
+    tipo de match: "exact" / "alias" / "fuzzy" / "nif" / "none" / "empty"
+    """
+    if not query_name.strip() and not query_nif.strip():
+        return df, "empty", ""
+
+    # 1. NIF exacto (más restrictivo)
+    if query_nif.strip():
+        nif_clean = query_nif.strip().upper().replace(" ", "").replace("-", "")
+        m = df.filter(
+            pl.col("nif").str.to_uppercase().str.replace_all(" ", "").str.replace_all("-", "")
+            == nif_clean
+        )
+        if m.height > 0:
+            n_emp = m["facility_id_external"].n_unique()
+            return m, "nif", f"✅ Match exacto por NIF `{nif_clean}` → {n_emp} empresa(s)"
+        # Si NIF no encontró, sigue con búsqueda por nombre si existe
+
+    # 2. Búsqueda por nombre (sin query: salir)
+    if not query_name.strip():
+        return df.filter(pl.lit(False)), "none", "❌ Ningún resultado para el NIF buscado."
+
+    q = query_name.strip()
+    q_upper = q.upper()
+    q_normalized = _strip_accents(q.lower())
+
+    # 2a. Contains directo en facility_name (case-insensitive + sin tildes)
+    #     Polars no tiene strip_accents nativo, así que usamos map_elements para
+    #     normalizar facility_name al vuelo.
+    m1 = df.filter(
+        pl.col("facility_name")
+        .map_elements(
+            lambda s: q_normalized in _strip_accents(s.lower()) if s else False,
+            return_dtype=pl.Boolean,
+        )
+    )
+    if m1.height > 0:
+        n_emp = m1["facility_id_external"].n_unique()
+        return m1, "exact", (
+            f"✅ **{n_emp} empresa(s)** encontradas con coincidencia directa en razón social "
+            f"para `{q}` ({m1.height:,} líneas)."
+        )
+
+    # 2b. Alias marca → razón social
+    aliased_terms = find_aliased_terms(q)
+    if aliased_terms:
+        # OR de varios contains
+        condition = None
+        for term in aliased_terms:
+            cond = pl.col("facility_name").str.to_uppercase().str.contains(term.upper())
+            condition = cond if condition is None else (condition | cond)
+        if condition is not None:
+            m2 = df.filter(condition)
+            if m2.height > 0:
+                n_emp = m2["facility_id_external"].n_unique()
+                terms_str = " / ".join(f"'{t}'" for t in aliased_terms)
+                return m2, "alias", (
+                    f"✅ **{n_emp} empresa(s)** encontradas vía alias conocido: "
+                    f"`{q}` → {terms_str} ({m2.height:,} líneas).\n\n"
+                    f"💡 *Nuestras fuentes públicas usan razón social oficial. "
+                    f"Tu marca comercial está mapeada internamente.*"
+                )
+
+    # 2c. Fuzzy match con rapidfuzz (solo si query >= FUZZY_MIN_QUERY_LEN chars)
+    #     Queries muy cortas dan demasiados falsos positivos.
+    if len(q) >= FUZZY_MIN_QUERY_LEN:
+        try:
+            from rapidfuzz import fuzz, process
+
+            unique_names = df["facility_name"].unique().to_list()
+            unique_upper = [n.upper() for n in unique_names]
+            # WRatio: weighted combination de varios scorers, más equilibrado
+            matches = process.extract(
+                q_upper,
+                unique_upper,
+                scorer=fuzz.WRatio,
+                limit=10,
+                score_cutoff=FUZZY_SCORE_CUTOFF,
+            )
+            if matches:
+                matched_names = [unique_names[idx] for _, _, idx in matches]
+                avg_score = sum(score for _, score, _ in matches) / len(matches)
+                m3 = df.filter(pl.col("facility_name").is_in(matched_names))
+                if m3.height > 0:
+                    n_emp = m3["facility_id_external"].n_unique()
+                    top_examples = ", ".join(f"`{n}`" for n in matched_names[:3])
+                    return m3, "fuzzy", (
+                        f"🔍 **{n_emp} empresa(s)** encontradas por **similitud aproximada** "
+                        f"(score medio {avg_score:.0f}/100) para `{q}`.\n\n"
+                        f"Top candidatos: {top_examples}\n\n"
+                        f"💡 *Si no es la empresa que buscas, prueba con la razón social oficial "
+                        f"o más texto.*"
+                    )
+        except ImportError:
+            # rapidfuzz no instalado, ignorar fuzzy
+            pass
+
+    # 2d. Sin resultados ni en exact, ni alias, ni fuzzy
+    return df.filter(pl.lit(False)), "none", (
+        f"❌ **Sin coincidencias** para `{q}`.\n\n"
+        f"Causas posibles: (a) la empresa no opera en Cataluña, "
+        f"(b) no está autorizada en RGPGRC ni reporta a PRTR-ES, "
+        f"(c) la razón social oficial es muy distinta a la marca comercial.\n\n"
+        f"📧 [Avísame para añadirla al diccionario de aliases]"
+        f"(mailto:{CONTACT_EMAIL}?subject=Empresa%20que%20no%20aparece%20-%20{q})"
+    )
 
 
 def main() -> None:
@@ -117,24 +251,34 @@ def main() -> None:
     total_empresas = leads_all["facility_id_external"].n_unique()
 
     # ════════════════════════════════════════════════════════════
-    # 🔍 BUSCADOR PRINCIPAL — PANEL CENTRAL ARRIBA
+    # 🔍 BUSCADOR PRINCIPAL
     # ════════════════════════════════════════════════════════════
     with st.container():
         st.markdown("### 🔍 Buscar empresa específica")
+        st.caption(
+            "Búsqueda inteligente con 3 niveles: "
+            "(1) coincidencia directa, (2) diccionario de marcas→razón social, "
+            "(3) similitud aproximada (fuzzy). Cuando buscas, **se incluyen automáticamente "
+            "gestores y productores**."
+        )
         cols_search = st.columns([3, 2, 1])
         with cols_search[0]:
             search_name = st.text_input(
-                "Nombre de la empresa (búsqueda parcial, sin distinción mayús/minús)",
+                "Nombre o marca de la empresa",
                 value="",
-                placeholder="Ej: Damm, Seat, Mango, Roca, Ercros...",
-                help="Busca en el campo razón social. Coincidencias parciales (contiene).",
+                placeholder="Ej: GERCO, Damm, Seat, Ercros, CELSA, Nestlé...",
+                help=(
+                    "Busca por nombre comercial o razón social. "
+                    "Si buscas 'GERCO' encuentra 'GESTION DE RESIDUOS CONTAMINANTES'. "
+                    "Si buscas 'Damm' encuentra 'COMPAÑIA CERVECERA DAMM'."
+                ),
                 key="search_name",
             )
         with cols_search[1]:
             search_nif = st.text_input(
                 "NIF (búsqueda exacta)",
                 value="",
-                placeholder="A08015497",
+                placeholder="B60866803",
                 help=(
                     "Solo el 17% del demo tiene NIF asignado (Tier 1). "
                     "En el dataset completo: 100% identificados."
@@ -147,12 +291,11 @@ def main() -> None:
     st.markdown("---")
 
     # ════════════════════════════════════════════════════════════
-    # SIDEBAR — TODOS LOS FILTROS, ORGANIZADOS EN SECCIONES
+    # SIDEBAR — FILTROS ADICIONALES
     # ════════════════════════════════════════════════════════════
     st.sidebar.header("⚙️ Tus parámetros")
     st.sidebar.markdown("Ajusta para simular el alcance de **tu** planta de gestión de residuos.")
 
-    # ── Parámetros de tu planta (siempre visible) ──
     with st.sidebar.expander("📍 Tu planta + radio operativo", expanded=True):
         plant_lat = st.number_input(
             "Latitud planta",
@@ -186,7 +329,6 @@ def main() -> None:
             help="Volumen anual mínimo y máximo que tu planta puede absorber",
         )
 
-    # ── Filtros de residuo (LER) ──
     with st.sidebar.expander("♻️ Residuo (LER)", expanded=False):
         target_lers_input = st.text_input(
             "Códigos LER objetivo (6 dígitos, coma separados)",
@@ -196,7 +338,6 @@ def main() -> None:
         )
         target_lers = [t.strip() for t in target_lers_input.split(",") if t.strip()]
 
-        # Capítulo LER (primeros 2 dígitos)
         capitulos_disponibles = (
             leads_all.select(pl.col("ler_code").str.slice(0, 2).alias("cap"))
             .unique()
@@ -238,7 +379,6 @@ def main() -> None:
             help="Busca en la descripción ES (contiene, sin distinción mayús/minús)",
         )
 
-    # ── Filtros geográficos ──
     with st.sidebar.expander("🗺️ Geografía", expanded=False):
         provincia_opciones = sorted(leads_all["provincia"].unique().drop_nulls().to_list())
         provincia_sel = st.multiselect(
@@ -248,7 +388,6 @@ def main() -> None:
             help="Filtra por provincia(s) catalana(s)",
         )
 
-        # Comarcas filtradas por provincia (si hay)
         if provincia_sel:
             comarca_pool = (
                 leads_all.filter(pl.col("provincia").is_in(provincia_sel))["comarca"]
@@ -265,7 +404,6 @@ def main() -> None:
             help="Subdivisiones de la provincia (limitadas a la provincia seleccionada si hay)",
         )
 
-        # Municipios filtrados por provincia/comarca
         muni_filter = leads_all
         if provincia_sel:
             muni_filter = muni_filter.filter(pl.col("provincia").is_in(provincia_sel))
@@ -279,7 +417,6 @@ def main() -> None:
             help="Solo aparecen los municipios geocodificados (~14% del demo)",
         )
 
-    # ── Filtros temporales ──
     with st.sidebar.expander("📅 Tiempo", expanded=False):
         years_disponibles = sorted(leads_all["last_year"].unique().drop_nulls().to_list())
         years_sel = st.multiselect(
@@ -297,7 +434,6 @@ def main() -> None:
             help="Empresas que han reportado en al menos N años (más años = más estable)",
         )
 
-    # ── Filtros de cualidad ──
     with st.sidebar.expander("🎯 Cualidad del lead", expanded=False):
         conf_opciones = sorted(leads_all["nivel_confianza_id"].unique().drop_nulls().to_list())
         conf_sel = st.multiselect(
@@ -326,12 +462,15 @@ def main() -> None:
             help="Score de prioridad mínimo (0-100). Mayor score = mejor lead.",
         )
 
-    # ── Opciones avanzadas ──
     with st.sidebar.expander("⚙️ Opciones avanzadas", expanded=False):
-        show_gestores = st.checkbox(
-            "Incluir gestores sospechosos",
+        show_gestores_default = st.checkbox(
+            "Incluir gestores sospechosos (por defecto cuando NO hay búsqueda)",
             value=False,
-            help="Empresas con perfil de gestora (no productor real). Por defecto excluidas.",
+            help=(
+                "Empresas con perfil de gestora (no productor). "
+                "**Cuando buscas por nombre/NIF, se incluyen automáticamente** "
+                "para no perder coincidencias."
+            ),
         )
         only_with_precise_coord = st.checkbox(
             "Solo coord exacta (sin centroide)",
@@ -356,7 +495,6 @@ def main() -> None:
             }[x],
         )
 
-    # ── CTA de contacto ──
     st.sidebar.markdown("---")
     st.sidebar.markdown(
         f"""
@@ -374,22 +512,17 @@ def main() -> None:
     )
 
     # ════════════════════════════════════════════════════════════
-    # APLICAR FILTROS — orden importa para performance
+    # APLICAR BÚSQUEDA INTELIGENTE + FILTROS
     # ════════════════════════════════════════════════════════════
-    filtered = leads_all
+    has_search = bool(search_name.strip() or search_nif.strip())
 
-    # 1. Buscador por nombre (más selectivo, lo primero)
-    if search_name.strip():
-        filtered = filtered.filter(
-            pl.col("facility_name").str.to_lowercase().str.contains(search_name.lower().strip())
-        )
+    # 1. Búsqueda inteligente (puede ser sobre TODO el dataset incluyendo gestores)
+    filtered, match_type, match_msg = _smart_search(leads_all, search_name, search_nif)
 
-    # 2. Buscador por NIF exacto
-    if search_nif.strip():
-        nif_clean = search_nif.strip().upper().replace(" ", "").replace("-", "")
-        filtered = filtered.filter(
-            pl.col("nif").str.to_uppercase().str.replace_all(" ", "") == nif_clean
-        )
+    # 2. Auto-include gestores si hay búsqueda activa
+    #    Si NO hay búsqueda, respeta el checkbox del usuario
+    if not has_search and not show_gestores_default:
+        filtered = filtered.filter(pl.col("lead_type") == "productor")
 
     # 3. Geografía
     if provincia_sel:
@@ -429,13 +562,11 @@ def main() -> None:
     if score_min > 0:
         filtered = filtered.filter(pl.col("score_prioridad") >= score_min)
 
-    # 7. Avanzadas
-    if not show_gestores:
-        filtered = filtered.filter(pl.col("lead_type") == "productor")
+    # 7. Coord exacta
     if only_with_precise_coord:
         filtered = filtered.filter(pl.col("huella_geocod").is_in(["accidents_greus", "geocoded"]))
 
-    # 8. Distancia y capacidad (recalculadas con la planta del usuario)
+    # 8. Distancia y capacidad
     filtered = filtered.with_columns(
         pl.struct(["lat", "lon"])
         .map_elements(
@@ -457,8 +588,18 @@ def main() -> None:
     )
 
     # ════════════════════════════════════════════════════════════
-    # KPIs
+    # MENSAJE DE BÚSQUEDA + KPIs
     # ════════════════════════════════════════════════════════════
+    if has_search and match_msg:
+        if match_type == "exact" or match_type == "nif":
+            st.success(match_msg)
+        elif match_type == "alias":
+            st.info(match_msg)
+        elif match_type == "fuzzy":
+            st.warning(match_msg)
+        elif match_type == "none":
+            st.error(match_msg)
+
     n_leads = filtered.height
     n_empresas = filtered["facility_id_external"].n_unique()
     n_lers = filtered["ler_code"].n_unique()
@@ -472,26 +613,11 @@ def main() -> None:
     col4.metric("Toneladas/año", f"{t_total:,.0f}")
     col5.metric("Dist media (km)", f"{avg_dist:.1f}")
 
-    # ── Indicador especial cuando se hace búsqueda por nombre/NIF ──
-    if search_name.strip() or search_nif.strip():
-        if n_empresas > 0:
-            st.success(
-                f"✅ **{n_empresas} empresa(s)** encontradas con "
-                f"{n_leads} líneas de residuo declaradas. "
-                f"Ver detalle en la pestaña 'Top leads' debajo."
-            )
-        else:
-            st.error(
-                f"❌ Ningún resultado para tu búsqueda. "
-                "Causas posibles: (a) la empresa no está en Cataluña, "
-                "(b) no es productora de residuos declarante en PRTR/ARC, "
-                "(c) escribió la razón social de otra forma — prueba con menos letras. "
-                f"Si estás seguro de que debería aparecer: [escríbeme]"
-                f"(mailto:{CONTACT_EMAIL}?subject=Empresa%20que%20no%20aparece%20en%20demo)."
-            )
-
     if n_leads == 0:
-        st.warning("Sin leads con los filtros actuales. Relaja los parámetros del lateral.")
+        st.warning(
+            "Sin leads con los filtros actuales. Relaja los parámetros del lateral "
+            "(amplía radio, sube rango de toneladas, o quita filtros de comarca/municipio)."
+        )
         st.stop()
 
     # ════════════════════════════════════════════════════════════
@@ -501,16 +627,17 @@ def main() -> None:
         ["📋 Top leads", "🗺️ Mapa", "📊 Distribuciones", "🏢 Por empresa"]
     )
 
-    # ── Tab 1: Top leads ──
     with tab_table:
-        st.subheader(
-            f"Mostrando top {min(top_n_display, n_leads):,} de {n_leads:,} leads filtrados"
-        )
+        st.subheader(f"Mostrando top {min(top_n_display, n_leads):,} de {n_leads:,} leads filtrados")
         sort_desc = sort_by not in ("facility_name", "dist_recalc_km")
         display = (
             filtered.sort(sort_by, descending=sort_desc, nulls_last=True)
             .head(top_n_display)
+            .with_columns(
+                pl.col("lead_type").replace(LEAD_TYPE_LABELS).alias("Tipo"),
+            )
             .select(
+                "Tipo",
                 pl.col("score_prioridad").round(1).alias("Score"),
                 pl.col("facility_name").alias("Empresa"),
                 pl.col("provincia").alias("Provincia"),
@@ -536,7 +663,6 @@ def main() -> None:
             f"(mailto:{CONTACT_EMAIL}?subject=Producto%20leads%20residuos)"
         )
 
-    # ── Tab 2: Mapa ──
     with tab_map:
         st.subheader("Mapa de leads filtrados")
         precise = filtered.filter(
@@ -560,7 +686,6 @@ def main() -> None:
                 "Quita 'Solo coord exacta' o relaja filtros geográficos."
             )
 
-    # ── Tab 3: Distribuciones ──
     with tab_dist:
         col_a, col_b = st.columns(2)
         with col_a:
@@ -603,7 +728,6 @@ def main() -> None:
                 hide_index=True,
             )
 
-    # ── Tab 4: Por empresa (NUEVO — agregado por facility) ──
     with tab_companies:
         st.subheader(f"Vista agregada por empresa ({n_empresas:,} únicas)")
         st.caption(
@@ -611,7 +735,9 @@ def main() -> None:
             "Útil para evaluar el potencial total de cada cliente."
         )
         by_company = (
-            filtered.group_by("facility_id_external", "facility_name", "provincia", "municipi")
+            filtered.group_by(
+                "facility_id_external", "facility_name", "provincia", "municipi", "lead_type"
+            )
             .agg(
                 pl.col("score_prioridad").max().round(1).alias("Score_max"),
                 pl.col("ler_code").n_unique().alias("N_LERs"),
@@ -624,7 +750,11 @@ def main() -> None:
             )
             .sort("Score_max", descending=True)
             .head(top_n_display)
+            .with_columns(
+                pl.col("lead_type").replace(LEAD_TYPE_LABELS).alias("Tipo"),
+            )
             .select(
+                "Tipo",
                 "Score_max",
                 pl.col("facility_name").alias("Empresa"),
                 pl.col("provincia").alias("Provincia"),
