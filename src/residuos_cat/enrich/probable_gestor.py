@@ -306,7 +306,20 @@ def main() -> None:
     comerciales = get_gestoras_comerciales_df()
     print(f"  + {comerciales.height} empresas comerciales del diccionario manual")
     gestores = pl.concat([gestores, comerciales], how="diagonal")
-    print(f"  → Total gestoras combinadas: {gestores.height:,}")
+
+    # Cargar gestoras Apify (gestoresderesiduos.org Cataluña)
+    apify_path = repo_root / "data/10_staging/apify/gestores_apify.parquet"
+    if apify_path.exists():
+        apify_gest = pl.read_parquet(apify_path).select(
+            "oid", "nom", "poblacio", "ambit_territorial", "categoria", "lat", "lon", "geo_source"
+        )
+        print(f"  + {apify_gest.height} empresas Apify (gestoresderesiduos.org)")
+        gestores = pl.concat([gestores, apify_gest], how="diagonal")
+
+    # Dedup por nombre + municipio (mismo gestor en varias fuentes)
+    n_before = gestores.height
+    gestores = gestores.unique(subset=["nom", "poblacio"], keep="first")
+    print(f"  → Total gestoras combinadas: {n_before:,} → {gestores.height:,} (tras dedup)")
 
     print(f"Reparando coords con municipis_catalunya_geo de {muni_path}…")
     municipis = pl.read_parquet(muni_path)
