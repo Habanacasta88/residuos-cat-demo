@@ -285,7 +285,8 @@ def enrich_leads_with_probable_gestor(
 
 def main() -> None:
     """Script de enriquecimiento — uso CLI."""
-    from ._geocoding_fallback import repair_gestores_coords  # noqa: PLC0415
+    from ._geocoding_fallback import repair_gestores_coords
+    from ._gestoras_comerciales import get_gestoras_comerciales_df
 
     repo_root = Path(__file__).resolve().parents[3]
     leads_path = repo_root / "data/30_enriched/leads_scored.parquet"
@@ -300,13 +301,18 @@ def main() -> None:
 
     print(f"Cargando gestoras de {gestores_path}…")
     gestores = pl.read_parquet(gestores_path)
-    print(f"  {gestores.height:,} gestoras cargadas")
+    print(f"  {gestores.height:,} instalaciones RGPGRC cargadas")
+
+    comerciales = get_gestoras_comerciales_df()
+    print(f"  + {comerciales.height} empresas comerciales del diccionario manual")
+    gestores = pl.concat([gestores, comerciales], how="diagonal")
+    print(f"  → Total gestoras combinadas: {gestores.height:,}")
 
     print(f"Reparando coords con municipis_catalunya_geo de {muni_path}…")
     municipis = pl.read_parquet(muni_path)
     gestores = repair_gestores_coords(gestores, municipis)
     n_valid = clean_gestores(gestores).height
-    print(f"  Gestoras con coord válida ahora: {n_valid:,} (antes ~513)")
+    print(f"  Gestoras con coord válida ahora: {n_valid:,} (de {gestores.height:,})")
 
     print("\nEnriqueciendo con gestor probable…")
     enriched = enrich_leads_with_probable_gestor(leads, gestores)
